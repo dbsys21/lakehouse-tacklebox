@@ -1,0 +1,199 @@
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, round, udf, lit, concat
+from pyspark.sql.types import StringType
+from datetime import datetime
+import json
+import os
+from urllib.parse import urljoin, urlencode
+import pyarrow
+import requests
+import uuid
+
+# NOTE set debuglevel = 1 (or higher) for http debug logging
+from http.client import HTTPConnection
+HTTPConnection.debuglevel = 0
+
+from QueryReplayTest import QueryReplayTest  # Assuming you have a local module for QueryReplayTest
+
+# Expects context environment variables; see example-env.bash
+# resolve workspace, warehouse and auth token from env (or fail)
+HOST = os.getenv('HOST')
+URL = os.getenv('URL')
+if HOST and not URL:
+    URL = f"https://{HOST}/api/2.0/sql/statements/"
+WAREHOUSE = os.getenv("WAREHOUSE")
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN")
+
+print("--------Step 1. Getting Data----------")
+
+spark = SparkSession.builder.appName("get_statement_result").getOrCreate()
+
+assert URL and WAREHOUSE and AUTH_TOKEN, "Required: HOST||URL, WAREHOUSE, and AUTH_TOKEN"
+
+# example statement big enough to exceed 5MB data requirement
+limit = None
+# sql_statement = "SELECT concat_ws('-', M.id, N.id, random()) as ID FROM range(1000) AS M, range(1000) AS N".format(limit)
+sql_statement = '''
+    SELECT 
+        ROUND(query_start_time_ms / 1000, 0) as start_time,
+        warehouse_id,
+        duration AS total_duration_ms,
+        query_id AS statement_id,
+        query_text AS statement_text,
+        query_start_time_ms,
+        query_end_time_ms,
+        duration
+    FROM perf_test.query_history.queries
+    WHERE statement_type IN ('SELECT', 'DESCRIBE', 'SHOW', 'USE', 'EXPLAIN')
+        AND query_start_time_ms BETWEEN 1699712716062 AND 1699713316885
+    ORDER BY start_time
+'''
+
+if limit:
+    sql_statement = "{sql_statement} LIMIT {limit}"
+
+payload = json.dumps({
+    "statement": sql_statement,
+    "warehouse_id": WAREHOUSE,
+    "wait_timeout": "0s",
+    "disposition": "EXTERNAL_LINKS",
+    "format": "ARROW_STREAM"
+})
+
+headers = {
+    'Content-Type': 'application/json'
+}
+auth=('token', AUTH_TOKEN)
+
+def process_success(response, limit=None):
+    chunks = response.json()["manifest"]["chunks"]
+    tables = []
+
+    print("{} chunks(s) in result set".format(len(chunks)))
+    for idx, chunkInfo in enumerate(chunks):
+        stmt_url = urljoin(URL, statement_id) + "/"
+        row_offset_param = urlencode({'row_offset': chunkInfo["row_offset"]})
+        print(stmt_url)
+        resolve_external_link_url = urljoin(stmt_url, "result/chunks/{}?{}".format(
+            chunkInfo["chunk_index"], row_offset_param))
+
+        response = requests.get(resolve_external_link_url, auth=auth, headers=headers)
+        assert response.status_code == 200
+
+        external_url = response.json()["external_links"][0]["external_link"]
+        # NOTE: do _NOT_ send the authorization header to external urls
+        raw_response = requests.get(external_url, auth=None, headers=None)
+        assert raw_response.status_code == 200
+
+        arrow_table = pyarrow.ipc.open_stream(raw_response.content).read_all()
+        tables.append(arrow_table)
+        print("chunk {} received".format(idx))
+
+    full_table = pyarrow.concat_tables(tables).to_pandas()
+    spark_df = spark.createDataFrame(full_table)
+    # print(full_table)
+    return spark_df
+
+print("Using URL:", URL)
+
+response = requests.post(URL, auth=auth, headers=headers, data=payload)
+print("Statement POST got HTTP status code:", response.status_code)
+assert response.status_code == 200
+state = response.json()["status"]["state"]
+statement_id = response.json()["statement_id"]
+
+while state in ["PENDING", "RUNNING"]:
+    stmt_url = urljoin(URL, statement_id)
+    response = requests.get(stmt_url, auth=auth, headers=headers)
+    print("Statement GET got HTTP status code:", response.status_code)
+    assert response.status_code == 200
+    state = response.json()["status"]["state"]
+
+assert state == "SUCCEEDED"
+result_df = process_success(response, limit)
+
+print("------------------")
+
+# # Show the DataFrame
+# input_df.show()
+
+print("--------Step 2. Tranform Data----------")
+
+def generate_uuid():
+    return str(uuid.uuid4())
+
+def transform_dataframe(input_df):
+    # Register the function as a User Defined Function (UDF)
+    generate_uuid_udf = udf(generate_uuid, StringType())
+
+    # Add a new column with the new unique IDs
+    # TODO: remove the SET use_cached_result = false part for real testing
+    transformed_df = input_df.withColumn("statement_id", generate_uuid_udf()) \
+                            .withColumn("start_time", col("start_time") + 10) \
+                            .withColumn("statement_text", concat(lit("SET use_cached_result = false;"), col("statement_text"))) 
+    
+    return transformed_df
+
+def create_combined_input_df(number_of_copy):
+    # Create the original DataFrame
+    # input_df = create_input_df(start_time_range)
+    input_df = result_df
+
+    # Apply the transformation function to the original DataFrame
+    combined_input_df = input_df
+    for _ in range(number_of_copy):
+        input_df_copy = transform_dataframe(input_df)
+        combined_input_df = combined_input_df.union(input_df_copy)
+
+    return combined_input_df
+
+# set number of copy
+number_of_copy = 39
+combined_input_df = create_combined_input_df(number_of_copy)
+
+# Count the number of rows in the combined DataFrame
+print(combined_input_df.count())
+
+# print("--------Step 3. Replay queries ----------")
+
+start_time = datetime.now()
+print(f"Start time: {start_time}")
+
+# Create an instance of your modified QueryReplayTest class
+replay_test = QueryReplayTest(
+    test_name="query_replay_test_local",
+    result_catalog="perf_test",
+    result_schema="queries",
+    # Replace Databricks-specific utilities with local equivalents
+    token="dapi357f4e303ea1eddd81bd9efb01ed6d97",
+    #dbutils=LocalDbutils(),
+    source_warehouse_id="custom_data",
+    source_start_time="1970-01-01 00:00:00",
+    source_end_time="1970-01-01 00:00:00",
+    target_warehouse_size="X-Small",
+    target_warehouse_min_num_clusters=1,
+    target_warehouse_max_num_clusters=30,
+    target_warehouse_type="PRO",
+    target_warehouse_serverless=True,
+    target_warehouse_custom_tags=[
+        {"key": "business_unit", "value": "Analytics Platform Eng"},
+        {"key": "service_name", "value": "socrates-benchmarking"},
+        {"key": "resource_owner", "value": "zdavies"},
+    ],
+)
+
+input_df = combined_input_df.select("start_time", "statement_id", "statement_text", "duration")
+
+replay_test._query_df = input_df
+
+replay_test.query_df.count()
+
+test_id = replay_test.run(overwrite_schema=False)
+
+end_time = datetime.now()
+print(f"start time: {start_time}")
+print(f"end time: {end_time}")
+
+replay_test.show_run.display()
+replay_test.show_run_details.display()
