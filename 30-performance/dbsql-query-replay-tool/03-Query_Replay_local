@@ -27,7 +27,7 @@ AUTH_TOKEN = os.environ.get("AUTH_TOKEN")
 
 print("--------Step 1. Getting Data----------")
 
-spark = SparkSession.builder.appName("get_statement_result").getOrCreate()
+spark = SparkSession.builder.appName("submit_queries").getOrCreate()
 
 assert URL and WAREHOUSE and AUTH_TOKEN, "Required: HOST||URL, WAREHOUSE, and AUTH_TOKEN"
 
@@ -46,7 +46,8 @@ sql_statement = '''
         duration
     FROM perf_test.query_history.queries
     WHERE statement_type IN ('SELECT', 'DESCRIBE', 'SHOW', 'USE', 'EXPLAIN')
-        AND query_start_time_ms BETWEEN 1699712716062 AND 1699713316885
+        AND query_start_time_ms BETWEEN 1701145203988 AND 1701145801401
+        --AND query_start_time_ms BETWEEN 1699712716062 AND 1699713316885
     ORDER BY start_time
 '''
 
@@ -113,11 +114,6 @@ while state in ["PENDING", "RUNNING"]:
 assert state == "SUCCEEDED"
 result_df = process_success(response, limit)
 
-print("------------------")
-
-# # Show the DataFrame
-# input_df.show()
-
 print("--------Step 2. Tranform Data----------")
 
 def generate_uuid():
@@ -131,7 +127,7 @@ def transform_dataframe(input_df):
     # TODO: remove the SET use_cached_result = false part for real testing
     transformed_df = input_df.withColumn("statement_id", generate_uuid_udf()) \
                             .withColumn("start_time", col("start_time") + 10) \
-                            .withColumn("statement_text", concat(lit("SET use_cached_result = false;"), col("statement_text"))) 
+                            # .withColumn("statement_text", concat(lit("SET use_cached_result = false;"), col("statement_text"))) 
     
     return transformed_df
 
@@ -149,7 +145,7 @@ def create_combined_input_df(number_of_copy):
     return combined_input_df
 
 # set number of copy
-number_of_copy = 39
+number_of_copy = 29
 combined_input_df = create_combined_input_df(number_of_copy)
 
 # Count the number of rows in the combined DataFrame
@@ -166,7 +162,8 @@ replay_test = QueryReplayTest(
     result_catalog="perf_test",
     result_schema="queries",
     # Replace Databricks-specific utilities with local equivalents
-    token="dapi357f4e303ea1eddd81bd9efb01ed6d97",
+    token=AUTH_TOKEN,
+    host=HOST,
     #dbutils=LocalDbutils(),
     source_warehouse_id="custom_data",
     source_start_time="1970-01-01 00:00:00",
@@ -195,5 +192,5 @@ end_time = datetime.now()
 print(f"start time: {start_time}")
 print(f"end time: {end_time}")
 
-replay_test.show_run.display()
-replay_test.show_run_details.display()
+# replay_test.show_run.display()
+# replay_test.show_run_details.display()
