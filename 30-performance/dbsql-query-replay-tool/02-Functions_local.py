@@ -13,6 +13,15 @@ from delta.tables import DeltaTable
 import os
 import logging
 
+# Generate a unique log file name based on the start time
+log_file_name = f"query_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+
+# Configure the logging module
+logging.basicConfig(
+    filename=log_file_name,
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 # logging.basicConfig()
 
 spark = DatabricksSession.builder.getOrCreate()
@@ -191,8 +200,9 @@ class QueryReplayTest:
         if wait_time > 0:
             time.sleep(wait_time)
         elif round(wait_time) < 0:
-            print(f"lagging behind by {abs(wait_time)} second")
+            logging.info(f"Lagging behind by {abs(wait_time)} second")
         res = self.send_query(statement)
+        logging.info(f"{datetime.now()} - Query sent - {res} - Statement ID: {res}")
         return res
 
     @retry(delay=2, jitter=2)
@@ -215,12 +225,14 @@ class QueryReplayTest:
         def query_sender(q1, q2):
             while True:
                 start_time, offset, qid, q, d = q1.get()
+                wait_time = offset - (datetime.now() - start_time).seconds
+                logging.info(f"{datetime.now()} - Sending query - {qid} - Wait time: {wait_time} seconds")
                 tid = self.wait_and_send_query(
                     offset - (datetime.now() - start_time).seconds, q
                 )
-                #print(f"{datetime.now()} - sending query - {tid}")
-                #logging.info(f"{datetime.now()} - sending query - {tid}")
+                logging.info(f"{datetime.now()} - Putting into submitted_q - {qid} - {tid}")
                 q2.put((qid, tid, d, datetime.now()+timedelta(seconds=d*0.8)))
+                logging.info(f"{datetime.now()} - Put into submitted_q - {qid}")
                 q1.task_done()
 
         def query_checker(q2, q3):
@@ -229,9 +241,9 @@ class QueryReplayTest:
                 if dt > datetime.now():
                     q2.put((qid, tid, d, dt))
                 else:
+                    logging.info(f"{datetime.now()} - Fetching result - {qid} - Statement ID: {tid}")
                     status = self.check_status(tid)
-                    # print(f"{datetime.now()} - fetching result - {tid} - {status}")
-                    # logging.info(f"{datetime.now()} - fetching result - {tid} - {status}")
+                    logging.info(f"{datetime.now()} - Status checked - {qid} - Status: {status} - {tid}")
                     if status not in ["SUCCEEDED", "FAILED", "CANCELED", "CLOSED"]:
                         q2.put((qid, tid, d, dt+timedelta(seconds=d/2)))
                     else:
@@ -266,6 +278,7 @@ class QueryReplayTest:
             print(
                 f"In Progress - {input_q.qsize()} queries to be sent - {submitted_q.qsize()} queries to be fetched - {completed_q.qsize()} / {len(queries)} queries completed"
             )
+            logging.info(f"{datetime.now()} - In Progress - {input_q.qsize()} queries to be sent - {submitted_q.qsize()} queries to be fetched - {completed_q.qsize()} / {len(queries)} queries completed")
             # logging.info(f"In Progress - {input_q.qsize()} queries to be sent - {submitted_q.qsize()} queries to be fetched - {completed_q.qsize()} / {len(queries)} queries completed")
             time.sleep(30)
 
@@ -446,7 +459,7 @@ class QueryReplayTest:
         # tables to store the query histories
         CATALOG_NAME = self.result_catalog
         DATABASE_NAME = self.result_schema
-        QUERIES_TABLE_NAME = "query_history1"
+        QUERIES_TABLE_NAME = "query_history"
 
         MAX_RESULTS_PER_PAGE = 1000
         MAX_PAGES_PER_RUN = 1000
@@ -524,10 +537,39 @@ class QueryReplayTest:
 
             is_table_exists = self.table_exists(CATALOG_NAME, DATABASE_NAME, QUERIES_TABLE_NAME)
 
+            print(is_table_exists)
+
+            print(query_results_clean.printSchema)
+
             if is_table_exists:
                 spark.sql(f"""
                             INSERT INTO {CATALOG_NAME}.{DATABASE_NAME}.{QUERIES_TABLE_NAME}
-                            SELECT * FROM newQueryResults
+                            SELECT
+                                canSubscribeToLiveQuery,
+                                channel_used,
+                                duration,
+                                endpoint_id,
+                                executed_as_user_id,
+                                executed_as_user_name,
+                                execution_end_time_ms,
+                                is_final,
+                                lookup_key,
+                                plans_state,
+                                query_end_time_ms,
+                                query_id,
+                                query_start_time_ms,
+                                query_text,
+                                rows_produced,
+                                statement_type,
+                                status,
+                                user_id,
+                                user_name,
+                                warehouse_id,
+                                spark_ui_url,
+                                error_message,
+                                query_start_time,
+                                query_end_time
+                            FROM newQueryResults
                         """)
             else:
                 spark.sql(f"""
