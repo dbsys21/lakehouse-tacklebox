@@ -36,18 +36,15 @@ limit = None
 # sql_statement = "SELECT concat_ws('-', M.id, N.id, random()) as ID FROM range(1000) AS M, range(1000) AS N".format(limit)
 sql_statement = '''
     SELECT 
-        ROUND(query_start_time_ms / 1000, 0) as start_time,
+        start_time,
         warehouse_id,
-        duration AS total_duration_ms,
-        query_id AS statement_id,
-        query_text AS statement_text,
+        total_duration_ms,
+        statement_id,
+        statement_text,
         query_start_time_ms,
         query_end_time_ms,
         duration
-    FROM perf_test.query_history.queries
-    WHERE statement_type IN ('SELECT', 'DESCRIBE', 'SHOW', 'USE', 'EXPLAIN')
-        AND query_start_time_ms BETWEEN 1701145203988 AND 1701145801401
-        --AND query_start_time_ms BETWEEN 1699712716062 AND 1699713316885
+    FROM perf_test.queries.test_data
     ORDER BY start_time
 '''
 
@@ -114,43 +111,6 @@ while state in ["PENDING", "RUNNING"]:
 assert state == "SUCCEEDED"
 result_df = process_success(response, limit)
 
-print("--------Step 2. Tranform Data----------")
-
-def generate_uuid():
-    return str(uuid.uuid4())
-
-def transform_dataframe(input_df):
-    # Register the function as a User Defined Function (UDF)
-    generate_uuid_udf = udf(generate_uuid, StringType())
-
-    # Add a new column with the new unique IDs
-    # TODO: remove the SET use_cached_result = false part for real testing
-    transformed_df = input_df.withColumn("statement_id", generate_uuid_udf()) \
-                            .withColumn("start_time", col("start_time") + 10) \
-                            # .withColumn("statement_text", concat(lit("SET use_cached_result = false;"), col("statement_text"))) 
-    
-    return transformed_df
-
-def create_combined_input_df(number_of_copy):
-    # Create the original DataFrame
-    # input_df = create_input_df(start_time_range)
-    input_df = result_df
-
-    # Apply the transformation function to the original DataFrame
-    combined_input_df = input_df
-    for _ in range(number_of_copy):
-        input_df_copy = transform_dataframe(input_df)
-        combined_input_df = combined_input_df.union(input_df_copy)
-
-    return combined_input_df
-
-# set number of copy
-number_of_copy = 29
-combined_input_df = create_combined_input_df(number_of_copy)
-
-# Count the number of rows in the combined DataFrame
-print(combined_input_df.count())
-
 # print("--------Step 3. Replay queries ----------")
 
 start_time = datetime.now()
@@ -180,9 +140,7 @@ replay_test = QueryReplayTest(
     ],
 )
 
-input_df = combined_input_df.select("start_time", "statement_id", "statement_text", "duration")
-
-replay_test._query_df = input_df
+replay_test._query_df = result_df.select("start_time", "statement_id", "statement_text", "duration")
 
 replay_test.query_df.count()
 
