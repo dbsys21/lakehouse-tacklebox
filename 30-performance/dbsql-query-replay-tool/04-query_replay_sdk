@@ -1,0 +1,230 @@
+# Databricks notebook source
+# MAGIC %pip install databricks-sdk==0.15.0
+# MAGIC dbutils.library.restartPython()
+
+# COMMAND ----------
+
+import logging
+from typing import Optional
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.sql import Disposition, QueryFilter, StatementState
+import pandas as pd
+import uuid
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from pyspark.sql import dataframe
+import databricks.sdk.service.sql
+
+# Initialize the logging configuration
+def setup_logging():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+setup_logging()
+
+# Create a workspace client instance
+w = WorkspaceClient()
+
+# COMMAND ----------
+
+query_history = spark.sql(
+        f"""
+        SELECT query_id as statement_id, query_start_time_ms, query_end_time_ms, query as statement_text, query_end_time_ms - query_start_time_ms as duration
+        FROM perf_test.scratch.dbx_warehouse_benchmarking_queryhistory
+        WHERE query_start_time_ms BETWEEN 1700127000041 AND 1700127601000
+        """
+    ).toPandas()
+query_history
+
+# COMMAND ----------
+
+def profile_query_history(df: pd.DataFrame) -> dataframe.DataFrame:
+
+  # Move data to Spark, I dislike pandas too much...
+  sdf = spark.createDataFrame(df)
+
+  sdf_adj = sdf \
+      .withColumn("query_start_time", F.floor(F.col("query_start_time_ms")/1000).cast("timestamp")) \
+      .withColumn("query_end_time",  F.floor(F.col("query_end_time_ms")/1000).cast("timestamp"))
+
+  # period for query history to join to later
+  time_range = sdf_adj.agg(
+      F.min(F.col("query_start_time_ms")).alias("min_time"),
+      F.max(F.col("query_end_time_ms")).alias("max_time")
+  ).collect()[0]
+
+  period_df = spark.range(time_range.min_time // 1000, (time_range.max_time // 1000) + 1)\
+    .toDF("timestamp")\
+    .withColumn("timestamp", F.col("timestamp").cast("timestamp"))
+
+  # queries starting
+  queries_started_at = sdf_adj \
+    .groupBy("query_start_time") \
+    .count() \
+    .withColumnRenamed("count", "queries_started") \
+    .withColumnRenamed("query_start_time", "timestamp")
+
+  # queries ending
+  queries_ending_at = sdf_adj \
+    .groupBy("query_end_time") \
+    .count() \
+    .withColumnRenamed("count", "queries_ending") \
+    .withColumnRenamed("query_end_time", "timestamp")
+
+  wspec = Window.orderBy("timestamp").rowsBetween(Window.unboundedPreceding, 0)
+  profile = period_df \
+    .join(queries_started_at, "timestamp", "left") \
+    .join(queries_ending_at, "timestamp", "left") \
+    .fillna(0) \
+    .withColumn("concurrent_queries", F.sum(F.col("queries_started") - F.col("queries_ending")).over(wspec))
+
+  return profile
+
+# COMMAND ----------
+
+def preprocess_query_history(df: pd.DataFrame, scenario_id: uuid.UUID) -> pd.DataFrame:
+    df = df.sort_values(by='query_start_time_ms')
+
+    # Calculate the delay for each query relative to the first query's start time
+    first_query_start_time = df.iloc[0]['query_start_time_ms']
+    df['delay'] = (df['query_start_time_ms'] - first_query_start_time) / 1000.0
+
+    df['statement_text'] = "-- Query Replay [OriginalQueryId: " + df['statement_id'] + f", ScenarioId: {scenario_id}]\n" + df['statement_text']
+
+    return df[['statement_id', 'statement_text', 'delay']]
+
+# COMMAND ----------
+
+def submit_query(warehouse_id: str, statement: str) -> Optional[str]:
+    try:
+        query = w.statement_execution.execute_statement(
+            statement=statement,
+            disposition=Disposition("EXTERNAL_LINKS"),
+            warehouse_id=warehouse_id,
+            wait_timeout="0s"
+        )
+        logging.info(f"Query submitted successfully [id: {query.statement_id}]")
+        return query.statement_id
+    except Exception as e:
+        logging.error(f"Failed to submit query: {e}")
+        return None
+
+# COMMAND ----------
+
+def get_query_result(statement_id: str) -> Optional[StatementState]:
+  try:
+    result = w.statement_execution.get_statement(statement_id=statement_id)
+    logging.info(f"Query status checked successfully [id: {statement_id}, state: {result.status.state.name}]")
+    return result.status.state
+  except Exception as e:
+    logging.error(f"Failed to closed query [id: {statement_id}]: {e}")
+    return None
+
+# COMMAND ----------
+
+def poll_for_query_results(statement_id: str, expected_duration: Optional[int] = None, threshold_to_wait: int = 0.8, interval: int = 2) -> Optional[str]:
+
+  # Only poll after threshold * expected duration
+  if expected_duration is not None:
+    delay_before_poll = max(0, expected_duration * threshold_to_wait)
+    time.sleep(delay_before_poll)
+
+  query_end_states = [StatementState.CANCELED, StatementState.FAILED, StatementState.CLOSED, StatementState.SUCCEEDED]
+
+  # Poll for query result
+  try:
+    result = None
+    while result is None or result not in query_end_states:
+      time.sleep(interval)
+      result = get_query_result(statement_id)  
+    return result
+    logging.info(f"Query {statement_id} completed with status: {result.state.value}")
+  except Exception as e:
+    logging.error(f"Error polling for query {statement_id}: {e}")
+
+# COMMAND ----------
+
+def submit_query_async(warehouse_id: str, query_text: str, scheduled_time: float, original_query_id: str, expected_duration: Optional[int] = None, polling_interval: int = 2):
+  now = time.time()
+
+  # Log the expected and actual
+  scheduled_time_str = datetime.fromtimestamp(scheduled_time).strftime('%Y-%m-%d %H:%M:%S')
+  now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+  logging.info(f"Pending submission of query {original_query_id}, scheduled at {scheduled_time_str}")
+
+  # Wait for the delay
+  delay = max(0, scheduled_time - now)
+  time.sleep(delay)
+  logging.info(f"Pending submission of query {original_query_id} at {scheduled_time_str}. Finished sleep of {delay}s.")
+
+  try:
+    statement_id = submit_query(warehouse_id, query_text)
+    delay_seconds = time.time() - scheduled_time
+    logging.info(f"Query {original_query_id} replayed as {statement_id}, {delay_seconds:.2f} seconds late")
+    if statement_id is not None:
+      poll_for_query_results(statement_id, expected_duration=expected_duration, interval = polling_interval)
+    else:
+      logging.warning("Query submitted, but no statement ID returned.")
+    return statement_id
+  except Exception as e:
+    logging.error(f"Error in replaying query {original_query_id}: {e}")
+    return None
+
+def replay_queries_concurrently(df: pd.DataFrame, warehouse_id: str, max_workers: int = 20):
+  session_start_time = time.time()
+
+  df['scheduled_time'] = df['delay'] + session_start_time
+
+  with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    futures = [executor.submit(submit_query_async, warehouse_id, row['statement_text'], row['scheduled_time'], row['statement_id']) for index, row in df.iterrows()]
+
+    for future in as_completed(futures):
+      pass
+
+# COMMAND ----------
+
+def get_replay_query_history(scenario_id: uuid.UUID, warehouse_id: str) -> Optional[pd.DataFrame]:
+  # `scenario_id` isn't used currently but can be used to filter logs if multiply replays are on same warehouse
+  
+  try:
+    filter = QueryFilter(warehouse_ids=[warehouse_id])
+    history = [q.as_dict() for q in w.query_history.list(filter_by=filter)]
+    return pd.DataFrame(query_history)
+  except Exception as e:
+    logging.error(f"Error in obtaining query history [ScenarioId: {scenario_id}, WarehouseId: {warehouse_id}]: {e}")
+    return None
+
+# COMMAND ----------
+
+# DBTITLE 1,Prep to run replay
+scenario_id = uuid.uuid4()
+processed_query_history = preprocess_query_history(query_history, scenario_id)
+query_history_analysis = profile_query_history(query_history)
+display(query_history_analysis)
+
+# COMMAND ----------
+
+# create a small serverless sql warehouse for testing purposes
+warehouse = w.warehouses.create_and_wait(
+    name=f"QueryReplayer: {scenario_id}",
+    auto_stop_mins=10,
+    cluster_size="Large",
+    max_num_clusters=5,
+    warehouse_type=databricks.sdk.service.sql.CreateWarehouseRequestWarehouseType.PRO,
+    enable_serverless_compute=False
+)
+
+# COMMAND ----------
+
+# DBTITLE 0,p
+replay_queries_concurrently(processed_query_history, warehouse.id, max_workers=250)
+
+# COMMAND ----------
+
+query_history = get_replay_query_history(scenario_id=scenario_id, warehouse_id=warehouse.id)
+
+# COMMAND ----------
+
+query_history
